@@ -2,8 +2,10 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 import os
+import sys
 
 import fire
+import functools
 import torch
 import torch.distributed as dist
 import torch.optim as optim
@@ -44,6 +46,12 @@ from utils.train_utils import (
     get_policies
 )
 
+sys.path.append("../distx")
+
+from data_parallel import DataParallelMeshInfo, MixedPrecisionPolicy
+from data_parallel.parallelize import data_parallelize
+from torch.distributed._tensor import DeviceMesh
+
 
 def main(**kwargs):
     # Update the configuration for the training and sharding process
@@ -64,8 +72,11 @@ def main(**kwargs):
         torch.cuda.set_device(local_rank)
         clear_gpu_cache(local_rank)
         setup_environ_flags(rank)
+        # Record history *after* distributed ranks have been initialized
+        torch.cuda.memory._record_memory_history()
 
     # Load the pre-trained model and setup its configuration
+    use_cache = False if train_config.enable_fsdp else None
     if train_config.enable_fsdp and train_config.low_cpu_fsdp:
         """
         for FSDP, we can save cpu memory by loading pretrained model on rank0 only.
@@ -83,9 +94,11 @@ def main(**kwargs):
                 train_config.model_name,
                 load_in_8bit=True if train_config.quantization else None,
                 device_map="auto" if train_config.quantization else None,
+                use_cache=use_cache,
             )
         else:
             llama_config = LlamaConfig.from_pretrained(train_config.model_name)
+            llama_config.use_cache = use_cache
             with torch.device("meta"):
                 model = LlamaForCausalLM(llama_config)
 
@@ -94,6 +107,7 @@ def main(**kwargs):
             train_config.model_name,
             load_in_8bit=True if train_config.quantization else None,
             device_map="auto" if train_config.quantization else None,
+            use_cache=use_cache,
         )
     if train_config.enable_fsdp and train_config.use_fast_kernels:
         """
@@ -135,22 +149,53 @@ def main(**kwargs):
 
             freeze_transformer_layers(train_config.num_freeze_layers)
 
-        mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
-        my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
+        USE_PER_PARAM = False
 
-        model = FSDP(
-            model,
-            auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
-            mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
-            sharding_strategy=fsdp_config.sharding_strategy,
-            device_id=torch.cuda.current_device(),
-            limit_all_gathers=True,
-            sync_module_states=train_config.low_cpu_fsdp,
-            param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
-            if train_config.low_cpu_fsdp and rank != 0 else None,
-        )
-        if fsdp_config.fsdp_activation_checkpointing:
-            policies.apply_fsdp_checkpointing(model)
+        if not USE_PER_PARAM:
+            mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
+            my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
+            from torch.distributed.fsdp import MixedPrecision
+            mixed_precision_policy = MixedPrecision(param_dtype=torch.bfloat16)
+
+            model = FSDP(
+                model,
+                auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
+                # mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
+                # mixed_precision=mixed_precision_policy,
+                sharding_strategy=fsdp_config.sharding_strategy,
+                device_id=torch.cuda.current_device(),
+                limit_all_gathers=True,
+                sync_module_states=train_config.low_cpu_fsdp,
+                param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
+                if train_config.low_cpu_fsdp and rank != 0 else None,
+            )
+            if fsdp_config.fsdp_activation_checkpointing:
+                policies.apply_fsdp_checkpointing(model)
+        else:
+            mesh = DeviceMesh("cuda", torch.arange(dist.get_world_size()))
+            mesh_info = DataParallelMeshInfo(mesh, shard_mesh_dim=0)
+            post_forward_mesh_info = mesh_info
+            mp_policy = MixedPrecisionPolicy(compute_dtype=torch.bfloat16)
+            fully_shard = functools.partial(
+                data_parallelize,
+                mesh_info=mesh_info,
+                post_forward_mesh_info=post_forward_mesh_info,
+                # mp_policy=mp_policy if not fsdp_config.pure_bf16 else MixedPrecisionPolicy(),
+            )
+            from torch.distributed._composable import checkpoint as checkpoint_activations
+            modules = list(model.modules())
+            num_activation_checkpoints_to_skip = 0
+            num_activation_checkpoints_skipped = 0
+            for module in reversed(modules):
+                if isinstance(module, LlamaDecoderLayer):
+                    if num_activation_checkpoints_skipped < num_activation_checkpoints_to_skip:
+                        num_activation_checkpoints_skipped += 1
+                    else:
+                        checkpoint_activations(module)
+                    fully_shard(module)
+            fully_shard(model)
+        if rank == 0:
+            print(f"Model: {model}")
     elif not train_config.quantization and not train_config.enable_fsdp:
         model.to("cuda")
 

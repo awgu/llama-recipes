@@ -1,3 +1,12 @@
 .DS_Store
 __pycache__
 .ipynb_checkpoints
+*.pickle
+profiles/
+PATH/
+_memory_viz.py
+llama-2-13b-hf/
+llama-2-7b-hf/
+*.out
+
+

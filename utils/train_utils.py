@@ -8,6 +8,7 @@ import yaml
 import time
 
 import fire
+import pickle
 import torch
 import transformers
 from datasets import load_dataset
@@ -36,6 +37,7 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from policies import bfSixteen, fpSixteen,bfSixteen_mixed, get_llama_wrapper
+from torch.distributed.utils import _cast_forward_inputs
 
 def set_tokenizer_params(tokenizer: LlamaTokenizer):
     tokenizer.pad_token_id = 0
@@ -78,6 +80,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     checkpoint_times = []
     results = {}
     best_val_loss = float("inf")
+    # TODO: Assume bf16 mp for now
+    use_mp = fsdp_config is not None and fsdp_config.mixed_precision
     for epoch in range(train_config.num_epochs):
         epoch_start_time = time.perf_counter()
         with MemoryTrace() as memtrace:  # track the memory usage
@@ -86,9 +90,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             total_length = len(train_dataloader)//gradient_accumulation_steps
             pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch}", total=total_length)
             for step, batch in enumerate(train_dataloader):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
                 for key in batch.keys():
                     if train_config.enable_fsdp:
                         batch[key] = batch[key].to(local_rank)
+                        if use_mp and torch.is_floating_point(batch[key]):  # HACK: input casting not supported yet
+                            batch[key] = batch[key].to(torch.bfloat16)
                     else:
                         batch[key] = batch[key].to('cuda:0')              
                 loss = model(**batch).loss
@@ -110,6 +119,30 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         optimizer.zero_grad()
                         pbar.update(step//gradient_accumulation_steps)
                 
+                end_event.record()
+                torch.cuda.synchronize()
+
+                if step == 4 and rank == 0:
+                    snapshot = torch.cuda.memory._snapshot()
+                    with open('snapshot.pickle', 'wb') as f:
+                        pickle.dump(snapshot, f)
+                if rank == 0:
+                    elapsed_time = start_event.elapsed_time(end_event)
+                    print(f"elapsed time / iteration: {elapsed_time:.3f} ms")
+                    mem_stats = torch.cuda.memory_stats()
+                    peak_active_gb = mem_stats["active_bytes.all.peak"] / (1024 ** 3)
+                    peak_reserved_gb = mem_stats["reserved_bytes.all.peak"] / (1024 ** 3)
+                    num_retries = mem_stats["num_alloc_retries"]
+                    print(f"peak active: {peak_active_gb} GiB | peak reserved: {peak_reserved_gb} GiB | num_retries: {num_retries}")
+                else:
+                    mem_stats = torch.cuda.memory_stats()
+                    peak_active_gb = mem_stats["active_bytes.all.peak"] / (1024 ** 3)
+                    peak_reserved_gb = mem_stats["reserved_bytes.all.peak"] / (1024 ** 3)
+                    num_retries = mem_stats["num_alloc_retries"]
+                    if num_retries > 0:
+                        print(f"[Rank {rank}] peak active: {peak_active_gb} GiB | peak reserved: {peak_reserved_gb} GiB | num_retries: {num_retries}")
+
+
                 pbar.set_description(f"Training Epoch: {epoch}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
                 
         epoch_end_time = time.perf_counter()-epoch_start_time
