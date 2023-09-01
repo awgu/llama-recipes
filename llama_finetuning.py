@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+import functools
 import os
 import sys
 from typing import List, Union
@@ -85,6 +86,7 @@ def main(**kwargs):
     if torch.distributed.is_initialized():
         torch.cuda.set_device(rank)
         setup_environ_flags(rank)
+        torch.cuda.memory._record_memory_history()
     
     # Calculate gradient accumulation steps
     gradient_accumulation_steps = train_config.batch_size_training // train_config.micro_batch_size
@@ -134,14 +136,14 @@ def main(**kwargs):
                 # Handle the ImportError here, such as providing an alternative implementation or an error message.
                 print("The required module 'torch.distributed.optim' is not available.")
             model = FSDP(
-            model,
-            auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
-            mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
-            sharding_strategy=fsdp_config.sharding_strategy,
-            device_id=torch.cuda.current_device(),
-            limit_all_gathers=True,
-            use_orig_params=True,
-        )
+                model,
+                auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
+                mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
+                sharding_strategy=fsdp_config.sharding_strategy,
+                device_id=torch.cuda.current_device(),
+                limit_all_gathers=True,
+                use_orig_params=True,
+            )
             
         else:    
             model = FSDP(
@@ -155,6 +157,7 @@ def main(**kwargs):
         
         if fsdp_config.fsdp_activation_checkpointing:
             policies.apply_fsdp_checkpointing(model)
+
     elif not train_config.quantization and not train_config.enable_fsdp:
         model.to("cuda")
 

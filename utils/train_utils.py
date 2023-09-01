@@ -67,13 +67,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     Returns: results dictionary containing average training and validation perplexity and loss
     """
     # Create a gradient scaler for fp16
-    torch.cuda.memory._record_memory_history(True,
-        # keep 100,000 alloc/free events from before the snapshot
-        trace_alloc_max_entries=100000,
-
-        # record stack information for the trace events
-        trace_alloc_record_context=True)
-    
     if train_config.use_fp16 and train_config.enable_fsdp:
         scaler = ShardedGradScaler()
     elif train_config.use_fp16 and not train_config.enable_fsdp:
@@ -92,46 +85,59 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         with MemoryTrace() as memtrace:  # track the memory usage
             model.train()
             total_loss = 0.0
-            # if fsdp_config.profile_mem:
-            #     with torch.profiler.profile(
-            #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-            #     activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
-            #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/llama2-7b'),
-            #     record_shapes=True,
-            #     profile_memory=True,
-            #     with_stack=True,
-            #     ) as prof:
-            for step, batch in enumerate(tqdm(train_dataloader,colour="blue", desc=f"Training Epoch{epoch}")):
-                if step >10:
-                    break
-                for key in batch.keys():
-                    if train_config.enable_fsdp:
-                        batch[key] = batch[key].to(local_rank)
-                    else:
-                        batch[key] = batch[key].to('cuda:0')              
-                loss = model(**batch).loss
-                loss = loss / gradient_accumulation_steps
-                total_loss += loss.detach().float()
-                if train_config.use_fp16:
-                    # if fp16 is enabled, use gradient scaler to handle gradient update
-                    scaler.scale(loss).backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                else:
-                    # regular backpropagation when fp16 is not used
-                    loss.backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                if step == 4:
-                    if rank==0:
-                        snapshot = torch.cuda.memory._snapshot()
-                        with open('snapshot.pickle', 'wb') as f:
-                            dump(snapshot, f)
-                        
-                print(f"\n step {step} is completed and loss is {loss.detach().float()}")
+            if fsdp_config.profile_mem:
+                with torch.profiler.profile(
+                    schedule=torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=1),
+                    activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler('profiles') if rank == 0 else None,
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
+                ) as prof:
+                    for step, batch in enumerate(tqdm(train_dataloader,colour="blue", desc=f"Training Epoch{epoch}")):
+                        if step > 10:
+                            break
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record()
+                        for key in batch.keys():
+                            if train_config.enable_fsdp:
+                                batch[key] = batch[key].to(local_rank)
+                            else:
+                                batch[key] = batch[key].to('cuda:0')
+                        loss = model(**batch).loss
+                        loss = loss / gradient_accumulation_steps
+                        total_loss += loss.detach().float()
+                        if train_config.use_fp16:
+                            # if fp16 is enabled, use gradient scaler to handle gradient update
+                            scaler.scale(loss).backward()
+                            if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                                scaler.step(optimizer)
+                                scaler.update()
+                                optimizer.zero_grad()
+                        else:
+                            # regular backpropagation when fp16 is not used
+                            loss.backward()
+                            if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                                optimizer.step()
+                                optimizer.zero_grad()
+                        end_event.record()
+                        torch.cuda.synchronize()
+                        if step == 4:
+                            if rank == 0:
+                                snapshot = torch.cuda.memory._snapshot()
+                                with open('snapshot.pickle', 'wb') as f:
+                                    dump(snapshot, f)
+                        if rank == 0:
+                            elapsed_time = start_event.elapsed_time(end_event)
+                            print(f"elapsed time / iteration: {elapsed_time:.3f} ms")
+                            mem_stats = torch.cuda.memory_stats()
+                            peak_active_gb = mem_stats["active_bytes.all.peak"] / (1024 ** 3)
+                            peak_reserved_gb = mem_stats["reserved_bytes.all.peak"] / (1024 ** 3)
+                            num_retries = mem_stats["num_alloc_retries"]
+                            print(f"peak active: {peak_active_gb} GB | peak reserved: {peak_reserved_gb} GB | num_retries: {num_retries}")
+                        prof.step()
+                        print(f"\n step {step} is completed and loss is {loss.detach().float()}")
                     
         end_epoch = time.perf_counter()
         epoch_time = end_epoch- start_epoch
